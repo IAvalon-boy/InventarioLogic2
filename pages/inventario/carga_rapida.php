@@ -23,11 +23,111 @@ if (!Session::isLoggedIn()) {
 $db = Database::getInstance();
 
 // ============================================
+// NUEVO: DESHACER IMPORTACIÓN
+// ============================================
+if (isset($_GET['deshacer']) && is_numeric($_GET['deshacer'])) {
+    $log_id = intval($_GET['deshacer']);
+    
+    try {
+        $log = $db->fetchOne("SELECT * FROM t_log_importaciones WHERE id = ?", [$log_id]);
+        if (!$log) {
+            $_SESSION['carga_resultado'] = "❌ Log de importación no encontrado.";
+            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+            exit;
+        }
+        
+        $detalles = $db->fetchAll(
+            "SELECT * FROM t_log_importacion_detalle WHERE log_id = ? AND accion = 'importado'",
+            [$log_id]
+        );
+        
+        if (empty($detalles)) {
+            $_SESSION['carga_resultado'] = "⚠️ No hay equipos para deshacer en esta importación.";
+            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+            exit;
+        }
+        
+        $eliminados = 0;
+        $errores = [];
+        
+        $tipo_mapeo = [
+            'PC' => 't_inventpc',
+            'IMPRESORA' => 't_impresores',
+            'UPS' => 't_ups',
+            'OTROS' => 't_otros'
+        ];
+        
+        foreach ($detalles as $detalle) {
+            $tipo = $detalle['tipo'] ?? 'OTROS';
+            $tabla = $tipo_mapeo[$tipo] ?? 't_otros';
+            $inventario = $detalle['inventario'];
+            
+            try {
+                $existe = $db->fetchOne("SELECT inventario FROM $tabla WHERE inventario = ?", [$inventario]);
+                if ($existe) {
+                    $db->query("DELETE FROM $tabla WHERE inventario = ?", [$inventario]);
+                    $eliminados++;
+                    $db->query(
+                        "UPDATE t_log_importacion_detalle SET accion = 'deshecho', mensaje = ? WHERE id = ?",
+                        ['Equipo eliminado al deshacer importación', $detalle['id']]
+                    );
+                } else {
+                    $errores[] = "Inventario $inventario no encontrado en $tabla (ya fue eliminado)";
+                }
+            } catch (Exception $e) {
+                $errores[] = "Error eliminando $inventario: " . $e->getMessage();
+            }
+        }
+        
+        $db->query(
+            "UPDATE t_log_importaciones SET deshecho = 1, fecha_deshecho = NOW() WHERE id = ?",
+            [$log_id]
+        );
+        
+        $mensaje = "✅ Importación #$log_id deshecha. Se eliminaron <strong>$eliminados</strong> equipos.";
+        if (!empty($errores)) {
+            $mensaje .= "<br>⚠️ " . count($errores) . " errores:<br><ul>";
+            foreach (array_slice($errores, 0, 10) as $error) {
+                $mensaje .= "<li>" . htmlspecialchars($error) . "</li>";
+            }
+            if (count($errores) > 10) {
+                $mensaje .= "<li>... y " . (count($errores) - 10) . " más</li>";
+            }
+            $mensaje .= "</ul>";
+        }
+        
+        $_SESSION['carga_resultado'] = $mensaje;
+        
+    } catch (Exception $e) {
+        $_SESSION['carga_resultado'] = "❌ Error al deshacer importación: " . $e->getMessage();
+    }
+    
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// ============================================
+// NUEVO: VER LOGS DE IMPORTACIÓN
+// ============================================
+if (isset($_GET['ver_logs'])) {
+    $_SESSION['ver_logs'] = true;
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+if (isset($_GET['ocultar_logs'])) {
+    unset($_SESSION['ver_logs']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// ============================================
 // LIMPIAR DIAGNÓSTICO
 // ============================================
 if (isset($_GET['limpiar'])) {
     unset($_SESSION['diagnostico_excel']);
     unset($_SESSION['debug_info']);
+    unset($_SESSION['equipos_seleccionados']);
     $_SESSION['carga_resultado'] = "🧹 Diagnóstico limpiado. Puedes subir un nuevo archivo.";
     header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
     exit;
@@ -48,7 +148,6 @@ if (isset($_GET['exportar_errores']) && $_GET['exportar_errores'] == '1') {
     $spreadsheet = new Spreadsheet();
     $sheet = $spreadsheet->getActiveSheet();
     
-    // Encabezados
     $headers = ['Fila', 'Inventario', 'Activo', 'CC', 'Ubicación', 'Tipo', 'Marca', 'Modelo', 'Serie', 'Errores'];
     $col = 'A';
     foreach ($headers as $header) {
@@ -57,7 +156,6 @@ if (isset($_GET['exportar_errores']) && $_GET['exportar_errores'] == '1') {
         $col++;
     }
     
-    // Datos
     $row = 2;
     foreach ($diagnostico['invalidos'] as $equipo) {
         $sheet->setCellValue('A' . $row, $equipo['fila'] ?? '');
@@ -73,13 +171,11 @@ if (isset($_GET['exportar_errores']) && $_GET['exportar_errores'] == '1') {
         $row++;
     }
     
-    // Estilo
     $sheet->getStyle('A1:J1')->getFont()->setBold(true);
     $sheet->getStyle('A1:J1')->getFill()->setFillType(Fill::FILL_SOLID)
-          ->getStartColor()->setARGB('FF1a1a2e');
+          ->getStartColor()->setARGB('FF1a237e');
     $sheet->getStyle('A1:J1')->getFont()->setColor(new Color(Color::COLOR_WHITE));
     
-    // Exportar
     header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     header('Content-Disposition: attachment;filename="errores_importacion_' . date('Y-m-d_H-i-s') . '.xlsx"');
     header('Cache-Control: max-age=0');
@@ -132,7 +228,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['procesar_excel'])) {
             exit;
         }
         
-        // Guardar nombre del archivo para el log
         $_SESSION['nombre_archivo_importacion'] = $file['name'];
         
         $datos_procesados = procesarExcelOriginal($rows, $db);
@@ -147,6 +242,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['procesar_excel'])) {
         
         $_SESSION['diagnostico_excel'] = $datos_procesados;
         unset($_SESSION['debug_info']);
+        unset($_SESSION['equipos_seleccionados']);
         
     } catch (Exception $e) {
         $_SESSION['carga_resultado'] = "❌ Error al leer el archivo: " . $e->getMessage();
@@ -177,6 +273,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['seleccionar_equipos'])
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
+    
+    // Guardar los inventarios seleccionados en sesión
+    $_SESSION['equipos_seleccionados'] = $equipos_seleccionados;
     
     $nuevos_todos = [];
     foreach ($diagnostico['todos_los_datos'] as $equipo) {
@@ -599,20 +698,38 @@ function extraerModeloDeDescripcion($descripcion, $marca) {
 }
 
 // ============================================
-// PROCESAR CONFIRMACIÓN CON LOG
+// PROCESAR CONFIRMACIÓN CON LOG (SOLO SELECCIONADOS)
 // ============================================
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'])) {
     $diagnostico = $_SESSION['diagnostico_excel'] ?? null;
+    $equipos_seleccionados = $_SESSION['equipos_seleccionados'] ?? [];
     
-    if (!$diagnostico || empty($diagnostico['validos'])) {
-        $_SESSION['carga_resultado'] = "❌ No hay equipos válidos para importar.";
+    if (!$diagnostico) {
+        $_SESSION['carga_resultado'] = "❌ No hay diagnóstico previo.";
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
     
-    // ============================================
+    // FILTRAR SOLO LOS EQUIPOS SELECCIONADOS
+    $equipos_a_importar = [];
+    if (!empty($equipos_seleccionados)) {
+        foreach ($diagnostico['validos'] as $equipo) {
+            if (in_array($equipo['inventario'], $equipos_seleccionados)) {
+                $equipos_a_importar[] = $equipo;
+            }
+        }
+    } else {
+        // Si no hay selección, usar todos los válidos (por seguridad)
+        $equipos_a_importar = $diagnostico['validos'];
+    }
+    
+    if (empty($equipos_a_importar)) {
+        $_SESSION['carga_resultado'] = "❌ No hay equipos seleccionados para importar. Por favor, selecciona al menos un equipo.";
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+    
     // APLICAR EDICIONES EN LÍNEA
-    // ============================================
     $cambios_aplicados = [];
     foreach ($_POST as $key => $value) {
         if (strpos($key, 'edit_') === 0) {
@@ -625,9 +742,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
         }
     }
     
-    // Aplicar cambios al array de válidos
     if (!empty($cambios_aplicados)) {
-        foreach ($diagnostico['validos'] as $idx => &$equipo) {
+        foreach ($equipos_a_importar as $idx => &$equipo) {
             $row_id_equipo = 'row_' . $idx;
             if (isset($cambios_aplicados[$row_id_equipo])) {
                 foreach ($cambios_aplicados[$row_id_equipo] as $campo => $valor) {
@@ -651,19 +767,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
     $detalle_log = [];
     $hoy = date('Y-m-d H:i:s');
     
-    // Iniciar log
     $nombre_archivo = $_SESSION['nombre_archivo_importacion'] ?? 'manual';
     $log_data = [
         'fecha_importacion' => $hoy,
         'usuario' => Session::get('user_id') ?? 'ADMIN',
         'nombre_archivo' => $nombre_archivo,
-        'total_equipos' => count($diagnostico['validos']),
+        'total_equipos' => count($equipos_a_importar),
         'importados' => 0,
         'errores' => 0,
-        'detalle' => ''
+        'detalle' => '',
+        'deshecho' => 0
     ];
     
-    foreach ($diagnostico['validos'] as $equipo) {
+    foreach ($equipos_a_importar as $equipo) {
         $tabla = $tipo_mapeo[$equipo['tipo']] ?? 't_otros';
         
         $existe = $db->fetchOne("SELECT inventario FROM $tabla WHERE inventario = ?", [$equipo['inventario']]);
@@ -730,13 +846,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
         }
     }
     
-    // Guardar log principal
     $log_data['importados'] = $registrados;
     $log_data['errores'] = count($errores);
     $log_data['detalle'] = json_encode($detalle_log);
     
     try {
-        // Crear tabla de logs si no existe
         $db->query("CREATE TABLE IF NOT EXISTS t_log_importaciones (
             id INT AUTO_INCREMENT PRIMARY KEY,
             fecha_importacion DATETIME NOT NULL,
@@ -746,6 +860,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
             importados INT DEFAULT 0,
             errores INT DEFAULT 0,
             detalle TEXT,
+            deshecho INT DEFAULT 0,
+            fecha_deshecho DATETIME NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )");
         
@@ -770,8 +886,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
     }
     
     unset($_SESSION['nombre_archivo_importacion']);
+    unset($_SESSION['equipos_seleccionados']);
     
-    $mensaje = "✅ Se importaron <strong>$registrados</strong> equipos.";
+    $mensaje = "✅ Se importaron <strong>$registrados</strong> equipos de <strong>" . count($equipos_a_importar) . "</strong> seleccionados.";
     if (!empty($errores)) {
         $mensaje .= "<br>⚠️ <strong>" . count($errores) . "</strong> errores:<br><ul>";
         foreach (array_slice($errores, 0, 10) as $error) {
@@ -781,6 +898,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['confirmar_importacion'
             $mensaje .= "<li>... y " . (count($errores) - 10) . " más</li>";
         }
         $mensaje .= "</ul>";
+    }
+    
+    if (isset($log_id)) {
+        $mensaje .= "<br><a href='" . $_SERVER['PHP_SELF'] . "?deshacer=$log_id' class='btn btn-danger btn-sm' onclick='return confirm(\"¿Estás seguro de deshacer la importación #$log_id? Se eliminarán todos los equipos importados.\")'>
+            <i class='bi bi-arrow-counterclockwise'></i> Deshacer importación
+        </a>";
     }
     
     $_SESSION['carga_resultado'] = $mensaje;
@@ -801,6 +924,8 @@ $diagnostico = $_SESSION['diagnostico_excel'] ?? null;
 $debug_info = $_SESSION['debug_info'] ?? null;
 unset($_SESSION['debug_info']);
 
+$mostrar_logs = $_SESSION['ver_logs'] ?? false;
+
 $total_grupos = 0;
 $total_duplicados = 0;
 $total_validos = 0;
@@ -820,6 +945,27 @@ if ($diagnostico && isset($diagnostico['equipos_por_tipo'])) {
 }
 $hay_pc = in_array('PC', $tipos_presentes);
 $hay_ups = in_array('UPS', $tipos_presentes);
+
+// ============================================
+// OBTENER LOGS DE IMPORTACIONES
+// ============================================
+$logs_importacion = [];
+if ($mostrar_logs) {
+    try {
+        $logs_importacion = $db->fetchAll(
+            "SELECT * FROM t_log_importaciones ORDER BY id DESC LIMIT 50"
+        );
+        foreach ($logs_importacion as &$log) {
+            $detalles = $db->fetchAll(
+                "SELECT COUNT(*) as total FROM t_log_importacion_detalle WHERE log_id = ? AND accion = 'importado'",
+                [$log['id']]
+            );
+            $log['equipos_importados'] = $detalles[0]['total'] ?? 0;
+        }
+    } catch (Exception $e) {
+        $logs_importacion = [];
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -829,134 +975,234 @@ $hay_ups = in_array('UPS', $tipos_presentes);
     <title>Carga Rápida - SIR</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../../assets/css/cyber-style.css">
+    <link rel="stylesheet" href="../../assets/css/style.css">
     <style>
-        .cyber-card {
-            background: rgba(10, 14, 26, 0.85);
-            border: 1px solid rgba(0, 240, 255, 0.12);
-            border-radius: 10px;
-            backdrop-filter: blur(10px);
+        /* ============================================ */
+        /* ESTILOS EXISTENTES (se mantienen igual)       */
+        /* ============================================ */
+        body {
+            background: #f0f2f5;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-        .cyber-card-header {
-            font-family: 'Orbitron', monospace;
-            color: #00f0ff;
-            padding: 6px 16px;
-            border-bottom: 1px solid rgba(0, 240, 255, 0.08);
-            font-size: 0.7rem;
-            letter-spacing: 1px;
+        .navbar-custom {
+            background: linear-gradient(135deg, #1a237e, #0d1757);
+            padding: 8px 16px;
         }
-        .cyber-card-body {
-            padding: 12px 16px !important;
+        .navbar-custom .navbar-brand {
+            font-weight: 700;
+            font-size: 1.2rem;
+            color: #fff;
         }
-        .carga-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            gap: 6px 10px;
+        .navbar-custom .navbar-brand i {
+            margin-right: 8px;
         }
-        .carga-grid label {
-            font-size: 0.55rem;
+        .navbar-custom .btn-outline-light {
+            border-color: rgba(255,255,255,0.2);
+            color: rgba(255,255,255,0.8);
+            font-size: 0.8rem;
+            padding: 4px 14px;
+            border-radius: 30px;
+        }
+        .navbar-custom .btn-outline-light:hover {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+        }
+        .card-custom {
+            border: none;
+            border-radius: 12px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        .card-custom .card-header {
+            background: linear-gradient(135deg, #1a237e, #0d1757);
+            color: #fff;
+            padding: 12px 20px;
+            border: none;
             font-weight: 600;
-            color: rgba(200, 214, 229, 0.4);
-            display: block;
-            margin-bottom: 1px;
+            font-size: 0.95rem;
             letter-spacing: 0.5px;
-            text-transform: uppercase;
         }
-        .carga-grid input, .carga-grid select {
-            width: 100%;
-            padding: 3px 6px;
-            background: rgba(0, 240, 255, 0.03);
-            border: 1px solid rgba(0, 240, 255, 0.1);
-            border-radius: 4px;
+        .card-custom .card-header i {
+            margin-right: 8px;
+        }
+        .card-custom .card-body {
+            background: #fff;
+            padding: 24px 28px !important;
+        }
+        .form-label-custom {
+            color: #555;
             font-size: 0.75rem;
-            color: #c8d6e5;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
         }
-        .carga-grid input:focus, .carga-grid select:focus {
-            border-color: #00f0ff;
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(0, 240, 255, 0.1);
+        .form-control-custom {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
-        .carga-grid select option {
-            background: #0a0e1a;
-            color: #c8d6e5;
+        .form-control-custom:focus {
+            border-color: #1a237e;
+            box-shadow: 0 0 0 3px rgba(26, 35, 126, 0.1);
         }
-        .campos-especificos {
-            display: none;
-            border-top: 1px solid rgba(0, 240, 255, 0.06);
-            padding-top: 8px;
-            margin-top: 8px;
-        }
-        .campos-especificos.visible {
-            display: block;
-        }
-        .badge-tipo-mini {
-            font-size: 0.5rem;
-            padding: 1px 8px;
-            border-radius: 10px;
-            display: inline-block;
-        }
-        .badge-tipo-mini.pc { background: rgba(0, 240, 255, 0.1); color: #00f0ff; }
-        .badge-tipo-mini.ups { background: rgba(255, 215, 0, 0.1); color: #ffd93d; }
-        
         .carga-btn {
-            background: linear-gradient(135deg, #00f0ff, #0066ff);
+            background: linear-gradient(135deg, #1a237e, #0d1757);
             border: none;
             color: #fff;
-            font-weight: 700;
-            border-radius: 6px;
-            padding: 6px 20px;
+            font-weight: 600;
+            border-radius: 8px;
+            padding: 10px 20px;
             transition: all 0.3s ease;
-            font-family: 'Orbitron', monospace;
-            font-size: 0.6rem;
-            letter-spacing: 1px;
-            cursor: pointer;
+            width: 100%;
+            font-size: 0.85rem;
+            letter-spacing: 0.5px;
         }
         .carga-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 0 25px rgba(0, 240, 255, 0.2);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(26, 35, 126, 0.3);
             color: #fff;
         }
         .carga-btn-success {
-            background: linear-gradient(135deg, #00e676, #00c853);
+            background: linear-gradient(135deg, #2e7d32, #1b5e20);
             border: none;
             color: #fff;
             font-weight: 700;
-            border-radius: 6px;
-            padding: 8px 24px;
+            border-radius: 8px;
+            padding: 12px 24px;
             transition: all 0.3s ease;
-            font-family: 'Orbitron', monospace;
-            font-size: 0.6rem;
+            width: 100%;
+            font-size: 0.85rem;
             letter-spacing: 1px;
-            cursor: pointer;
         }
         .carga-btn-success:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 0 30px rgba(0, 230, 118, 0.2);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(46, 125, 50, 0.3);
             color: #fff;
         }
         .carga-btn-success:disabled {
-            opacity: 0.4;
+            opacity: 0.5;
             cursor: not-allowed;
+            transform: none !important;
         }
         .btn-limpiar {
-            background: rgba(255, 45, 85, 0.05);
-            border: 1px solid rgba(255, 45, 85, 0.1);
-            color: #ff2d55;
-            padding: 4px 14px;
-            border-radius: 4px;
-            font-size: 0.6rem;
-            font-weight: 600;
+            background: transparent;
+            border: 1px solid #e0c0c0;
+            color: #c62828;
+            border-radius: 6px;
+            padding: 6px 16px;
             transition: all 0.3s ease;
-            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.75rem;
             text-decoration: none;
+            display: inline-block;
         }
         .btn-limpiar:hover {
-            background: rgba(255, 45, 85, 0.1);
-            border-color: rgba(255, 45, 85, 0.2);
-            color: #ff2d55;
+            background: #ffebee;
+            border-color: #c62828;
+            color: #b71c1c;
         }
-        
+        .btn-exportar-errores {
+            background: transparent;
+            border: 1px solid #e0c8a0;
+            color: #e65100;
+            border-radius: 6px;
+            padding: 6px 16px;
+            transition: all 0.3s ease;
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .btn-exportar-errores:hover {
+            background: #fff8e1;
+            border-color: #e65100;
+            color: #bf360c;
+        }
+        .btn-outline-custom {
+            background: transparent;
+            border: 1px solid #ddd;
+            color: #777;
+            border-radius: 8px;
+            padding: 10px 20px;
+            transition: all 0.3s ease;
+            font-weight: 600;
+            font-size: 0.85rem;
+            width: 100%;
+            text-decoration: none;
+            display: inline-block;
+            text-align: center;
+        }
+        .btn-outline-custom:hover {
+            background: #f5f5f5;
+            border-color: #bbb;
+            color: #333;
+        }
+        .btn-ver-logs {
+            background: transparent;
+            border: 1px solid #b0c4de;
+            color: #1a237e;
+            border-radius: 6px;
+            padding: 6px 16px;
+            transition: all 0.3s ease;
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .btn-ver-logs:hover {
+            background: #e8eaf6;
+            border-color: #1a237e;
+            color: #0d1757;
+        }
+        .btn-deshecho {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border: 1px solid #a5d6a7;
+            padding: 1px 10px;
+            border-radius: 10px;
+            font-size: 0.6rem;
+            font-weight: 600;
+        }
+        .btn-deshecho.eliminado {
+            background: #ffebee;
+            color: #c62828;
+            border-color: #ef9a9a;
+        }
+        .badge-custom {
+            background: #e8eaf6;
+            color: #1a237e;
+            border-radius: 20px;
+            padding: 2px 12px;
+            font-size: 0.65rem;
+            font-weight: 600;
+        }
+        .badge-custom-success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border-radius: 20px;
+            padding: 2px 12px;
+            font-size: 0.65rem;
+            font-weight: 600;
+        }
+        .badge-custom-danger {
+            background: #ffebee;
+            color: #c62828;
+            border-radius: 20px;
+            padding: 2px 12px;
+            font-size: 0.65rem;
+            font-weight: 600;
+        }
+        .badge-custom-warning {
+            background: #fff8e1;
+            color: #f57f17;
+            border-radius: 20px;
+            padding: 2px 12px;
+            font-size: 0.65rem;
+            font-weight: 600;
+        }
         .badge-tipo {
             display: inline-block;
             padding: 1px 10px;
@@ -964,147 +1210,169 @@ $hay_ups = in_array('UPS', $tipos_presentes);
             font-size: 0.5rem;
             font-weight: 600;
         }
-        .badge-tipo.pc { background: rgba(0, 240, 255, 0.1); color: #00f0ff; }
-        .badge-tipo.impresora { background: rgba(0, 230, 118, 0.1); color: #00e676; }
-        .badge-tipo.ups { background: rgba(255, 215, 0, 0.1); color: #ffd93d; }
-        .badge-tipo.otros { background: rgba(200, 214, 229, 0.05); color: rgba(200, 214, 229, 0.5); }
-        .badge-valid { background: rgba(0, 230, 118, 0.08); color: #00e676; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
-        .badge-invalid { background: rgba(255, 45, 85, 0.08); color: #ff2d55; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
-        .badge-duplicado { background: rgba(255, 215, 0, 0.08); color: #ffd93d; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
-        .badge-activo { background: rgba(255, 215, 0, 0.08); color: #ffd93d; padding: 1px 6px; border-radius: 8px; font-size: 0.5rem; font-weight: 600; }
-        .badge-seleccionado {
-            background: rgba(0, 230, 118, 0.08);
-            color: #00e676;
-            padding: 1px 8px;
-            border-radius: 10px;
-            font-size: 0.45rem;
-            font-weight: 600;
-        }
-        
-        .carga-tip { font-size: 0.65rem; color: rgba(200, 214, 229, 0.3); background: rgba(0, 240, 255, 0.02); padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(0, 240, 255, 0.04); margin-bottom: 6px; }
-        .carga-tip code { background: rgba(0,0,0,0.3); color: #00f0ff; padding: 1px 4px; border-radius: 3px; font-size: 0.6rem; }
-        .carga-result { padding: 8px 14px; border-radius: 6px; margin-bottom: 10px; font-size: 0.8rem; }
-        .carga-result.success { background: rgba(0, 230, 118, 0.06); border: 1px solid rgba(0, 230, 118, 0.12); color: #00e676; }
-        .carga-result.error { background: rgba(255, 45, 85, 0.06); border: 1px solid rgba(255, 45, 85, 0.12); color: #ff2d55; }
-        .carga-result.info { background: rgba(255, 215, 0, 0.06); border: 1px solid rgba(255, 215, 0, 0.12); color: #ffd93d; }
-        .section-divider { border-top: 1px solid rgba(0, 240, 255, 0.06); margin: 10px 0; }
-        
-        .diagnostico-container {
-            background: rgba(0, 240, 255, 0.02);
+        .badge-tipo.pc { background: #e3f2fd; color: #0d47a1; }
+        .badge-tipo.impresora { background: #fff3e0; color: #e65100; }
+        .badge-tipo.ups { background: #fff8e1; color: #f57f17; }
+        .badge-tipo.otros { background: #f5f5f5; color: #888; }
+        .badge-valid { background: #e8f5e9; color: #2e7d32; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
+        .badge-invalid { background: #ffebee; color: #c62828; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
+        .badge-duplicado { background: #fff8e1; color: #f57f17; padding: 1px 8px; border-radius: 10px; font-size: 0.5rem; font-weight: 600; }
+        .badge-activo { background: #fff8e1; color: #f57f17; padding: 1px 6px; border-radius: 8px; font-size: 0.5rem; font-weight: 600; }
+        .carga-tip {
+            font-size: 0.75rem;
+            color: #999;
+            background: #f8f9fa;
+            padding: 8px 12px;
             border-radius: 6px;
-            padding: 10px;
-            border: 1px solid rgba(0, 240, 255, 0.05);
+            border: 1px solid #eee;
+            margin-bottom: 10px;
+        }
+        .carga-tip code {
+            background: #e8eaf6;
+            color: #1a237e;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+        }
+        .carga-result {
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-size: 0.85rem;
+        }
+        .carga-result.success {
+            background: #e8f5e9;
+            border: 1px solid #c8e6c9;
+            color: #2e7d32;
+        }
+        .carga-result.error {
+            background: #ffebee;
+            border: 1px solid #ffcdd2;
+            color: #c62828;
+        }
+        .carga-result.info {
+            background: #fff8e1;
+            border: 1px solid #ffecb3;
+            color: #e65100;
+        }
+        .section-divider {
+            border-top: 1px solid #eee;
+            margin: 14px 0;
+        }
+        .diagnostico-container {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px;
+            border: 1px solid #eee;
         }
         .diagnostico-stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(70px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
             gap: 6px;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
         }
         .diagnostico-stats .stat {
             text-align: center;
-            padding: 4px;
-            border-radius: 4px;
-            background: rgba(0, 240, 255, 0.02);
-            border: 1px solid rgba(0, 240, 255, 0.04);
+            padding: 6px;
+            border-radius: 6px;
+            background: #fff;
+            border: 1px solid #eee;
         }
         .diagnostico-stats .stat .number {
-            font-family: 'Orbitron', monospace;
-            font-size: 1rem;
+            font-size: 1.1rem;
             font-weight: 700;
         }
         .diagnostico-stats .stat .label {
-            font-size: 0.45rem;
-            color: rgba(200, 214, 229, 0.3);
+            font-size: 0.5rem;
+            color: #999;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
-        .stat-valid .number { color: #00e676; }
-        .stat-invalid .number { color: #ff2d55; }
-        .stat-total .number { color: #00f0ff; }
-        .stat-grupos .number { color: #ffd93d; }
-        .stat-duplicados .number { color: #ffd93d; }
-        
+        .stat-valid .number { color: #2e7d32; }
+        .stat-invalid .number { color: #c62828; }
+        .stat-total .number { color: #1a237e; }
+        .stat-grupos .number { color: #f57f17; }
+        .stat-duplicados .number { color: #f57f17; }
         .diagnostico-table {
             width: 100%;
-            font-size: 0.6rem;
+            font-size: 0.7rem;
             border-collapse: collapse;
         }
         .diagnostico-table th {
             text-align: left;
-            color: rgba(200, 214, 229, 0.3);
+            color: #999;
             font-weight: 600;
-            font-size: 0.45rem;
+            font-size: 0.55rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            padding: 2px 6px;
-            border-bottom: 1px solid rgba(0, 240, 255, 0.06);
+            padding: 4px 8px;
+            border-bottom: 2px solid #eee;
             position: sticky;
             top: 0;
-            background: rgba(10, 14, 26, 0.95);
+            background: #fff;
             z-index: 1;
         }
         .diagnostico-table td {
-            padding: 2px 6px;
-            border-bottom: 1px solid rgba(0, 240, 255, 0.03);
-            color: #c8d6e5;
-            font-size: 0.55rem;
+            padding: 3px 8px;
+            border-bottom: 1px solid #f0f0f0;
+            color: #333;
+            font-size: 0.65rem;
         }
-        .diagnostico-table .row-valid td { border-left: 2px solid rgba(0, 230, 118, 0.3); }
-        .diagnostico-table .row-duplicado td { border-left: 2px solid rgba(255, 215, 0, 0.3); background: rgba(255, 215, 0, 0.02); }
-        .diagnostico-table .row-invalid td { border-left: 2px solid rgba(255, 45, 85, 0.3); }
-        .diagnostico-scroll { max-height: 300px; overflow-y: auto; border-radius: 4px; }
-        .diagnostico-scroll::-webkit-scrollbar { width: 4px; }
-        .diagnostico-scroll::-webkit-scrollbar-track { background: rgba(0, 240, 255, 0.02); border-radius: 4px; }
-        .diagnostico-scroll::-webkit-scrollbar-thumb { background: rgba(0, 240, 255, 0.15); border-radius: 4px; }
-        
-        .table-count { color: rgba(200, 214, 229, 0.2); font-size: 0.45rem; }
-        .seleccion-todos { color: rgba(200, 214, 229, 0.2); font-size: 0.5rem; cursor: pointer; }
-        .seleccion-todos:hover { color: rgba(200, 214, 229, 0.4); }
-        
+        .diagnostico-table .row-valid td { border-left: 3px solid #4caf50; }
+        .diagnostico-table .row-duplicado td { border-left: 3px solid #ffc107; background: #fffde7; }
+        .diagnostico-table .row-invalid td { border-left: 3px solid #f44336; }
+        .diagnostico-scroll {
+            max-height: 350px;
+            overflow-y: auto;
+            border-radius: 6px;
+            border: 1px solid #eee;
+            background: #fff;
+        }
+        .diagnostico-scroll::-webkit-scrollbar { width: 6px; }
+        .diagnostico-scroll::-webkit-scrollbar-track { background: #f5f5f5; border-radius: 4px; }
+        .diagnostico-scroll::-webkit-scrollbar-thumb { background: #ddd; border-radius: 4px; }
+        .table-count { color: #999; font-size: 0.55rem; }
+        .seleccion-todos {
+            color: #999;
+            font-size: 0.6rem;
+            cursor: pointer;
+        }
+        .seleccion-todos:hover { color: #666; }
         .error-list {
-            background: rgba(255, 45, 85, 0.02);
-            border: 1px solid rgba(255, 45, 85, 0.06);
-            border-radius: 4px;
-            padding: 6px 10px;
-            margin-top: 8px;
+            background: #fff;
+            border: 1px solid #ffcdd2;
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin-top: 6px;
             max-height: 150px;
             overflow-y: auto;
         }
         .error-list .error-item {
-            font-size: 0.55rem;
-            padding: 2px 0;
-            color: rgba(200, 214, 229, 0.6);
-            border-bottom: 1px solid rgba(255, 45, 85, 0.03);
+            font-size: 0.65rem;
+            padding: 3px 0;
+            color: #666;
+            border-bottom: 1px solid #f5f5f5;
         }
-        .error-list .error-item .badge-duplicado { font-size: 0.45rem; }
-        .error-list .error-item .badge-invalid { font-size: 0.45rem; }
-        
-        /* Estilos para selección de equipos */
         .equipo-checkbox {
-            accent-color: #00e676;
+            accent-color: #2e7d32;
             width: 14px;
             height: 14px;
             cursor: pointer;
             flex-shrink: 0;
         }
-        .equipo-checkbox:disabled {
-            opacity: 0.3;
-            cursor: not-allowed;
-        }
         .grupo-header {
             cursor: pointer;
-            padding: 4px 6px;
-            border-radius: 4px;
+            padding: 6px 8px;
+            border-radius: 6px;
             transition: background 0.2s;
         }
         .grupo-header:hover {
-            background: rgba(0, 240, 255, 0.03);
+            background: #f5f5f5;
         }
         .grupo-contenido {
             padding-left: 20px;
             margin-top: 4px;
-            border-left: 1px solid rgba(0, 240, 255, 0.04);
+            border-left: 2px solid #eee;
             display: none;
         }
         .grupo-contenido.abierto {
@@ -1114,86 +1382,237 @@ $hay_ups = in_array('UPS', $tipos_presentes);
             display: flex;
             align-items: center;
             gap: 6px;
-            padding: 1px 0;
-            border-bottom: 1px solid rgba(0, 240, 255, 0.02);
+            padding: 2px 0;
+            border-bottom: 1px solid #f5f5f5;
         }
         .equipo-item .equipo-info {
-            font-size: 0.55rem;
-            color: #c8d6e5;
+            font-size: 0.65rem;
+            color: #555;
         }
         .equipo-item .equipo-info .inv {
-            color: #00f0ff;
+            color: #1a237e;
             font-weight: 600;
         }
         .equipo-item .equipo-info .detalle {
-            color: rgba(200, 214, 229, 0.3);
-            font-size: 0.45rem;
+            color: #aaa;
+            font-size: 0.55rem;
         }
         .equipo-item .equipo-info .error-text {
-            color: rgba(200, 214, 229, 0.15);
-            font-size: 0.4rem;
+            color: #ccc;
+            font-size: 0.5rem;
             margin-left: 4px;
         }
         .equipo-item .estado-icon {
-            font-size: 0.45rem;
-            width: 16px;
+            font-size: 0.55rem;
+            width: 18px;
             text-align: center;
         }
-        .equipo-item .estado-icon.valido { color: #00e676; }
-        .equipo-item .estado-icon.duplicado { color: #ffd93d; }
-        .equipo-item .estado-icon.invalido { color: #ff2d55; }
-        
-        /* Estilos para edición en línea */
+        .equipo-item .estado-icon.valido { color: #4caf50; }
+        .equipo-item .estado-icon.duplicado { color: #ffc107; }
+        .equipo-item .estado-icon.invalido { color: #f44336; }
         .campo-editable {
-            background: rgba(0, 240, 255, 0.03);
-            border: 1px solid rgba(0, 240, 255, 0.06);
-            border-radius: 3px;
-            color: #c8d6e5;
-            font-size: 0.55rem;
-            padding: 1px 4px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            color: #333;
+            font-size: 0.6rem;
+            padding: 2px 6px;
             width: 100%;
             transition: all 0.3s ease;
         }
         .campo-editable:hover {
-            border-color: rgba(0, 240, 255, 0.15);
-            background: rgba(0, 240, 255, 0.06);
+            border-color: #bbb;
+            background: #fff;
         }
         .campo-editable:focus {
-            border-color: #00f0ff;
+            border-color: #1a237e;
             outline: none;
-            background: rgba(0, 240, 255, 0.08);
-            box-shadow: 0 0 0 2px rgba(0, 240, 255, 0.05);
+            background: #fff;
+            box-shadow: 0 0 0 2px rgba(26, 35, 126, 0.05);
         }
         .campo-editable.cambiado {
-            border-color: #ffd93d;
-            background: rgba(255, 215, 0, 0.05);
+            border-color: #ffc107;
+            background: #fffde7;
         }
-        
-        .btn-exportar-errores {
-            background: rgba(255, 215, 0, 0.05);
-            border: 1px solid rgba(255, 215, 0, 0.1);
-            color: #ffd93d;
-            padding: 3px 12px;
-            border-radius: 4px;
-            font-size: 0.55rem;
+        .carga-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 8px 12px;
+        }
+        .carga-grid label {
+            font-size: 0.6rem;
             font-weight: 600;
-            transition: all 0.3s ease;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-flex;
+            color: #999;
+            display: block;
+            margin-bottom: 2px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        .carga-grid input, .carga-grid select {
+            width: 100%;
+            padding: 4px 8px;
+            background: #fafafa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            color: #333;
+            transition: border-color 0.2s;
+        }
+        .carga-grid input:focus, .carga-grid select:focus {
+            border-color: #1a237e;
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(26, 35, 126, 0.05);
+        }
+        .carga-grid select option {
+            background: #fff;
+            color: #333;
+        }
+        .campos-especificos {
+            display: none;
+            border-top: 1px solid #eee;
+            padding-top: 10px;
+            margin-top: 10px;
+        }
+        .campos-especificos.visible {
+            display: block;
+        }
+        .badge-tipo-mini {
+            font-size: 0.55rem;
+            padding: 1px 10px;
+            border-radius: 10px;
+            display: inline-block;
+        }
+        .badge-tipo-mini.pc { background: #e3f2fd; color: #0d47a1; }
+        .badge-tipo-mini.ups { background: #fff8e1; color: #f57f17; }
+        .badge-seleccionado {
+            background: #e8f5e9;
+            color: #2e7d32;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 0.5rem;
+            font-weight: 600;
+        }
+        .grupo-card {
+            background: #fff;
+            border: 1px solid #eee;
+            border-radius: 6px;
+            padding: 6px 10px;
+            margin-bottom: 4px;
+        }
+        .grupo-card .grupo-ubicacion {
+            color: #1a237e;
+            font-weight: 600;
+            font-size: 0.7rem;
+        }
+        .grupo-card .grupo-count {
+            color: #999;
+            font-size: 0.6rem;
+        }
+        .grupo-card .grupo-estado {
+            font-size: 0.5rem;
+            color: #ccc;
+        }
+        .grupo-card .grupo-check {
+            display: flex;
             align-items: center;
             gap: 4px;
+            margin-top: 2px;
         }
-        .btn-exportar-errores:hover {
-            background: rgba(255, 215, 0, 0.1);
-            border-color: rgba(255, 215, 0, 0.2);
-            color: #ffd93d;
+        .grupo-card .grupo-check label {
+            color: #999;
+            font-size: 0.55rem;
+            cursor: pointer;
         }
-        
-        .mt-1 { margin-top: 4px; }
-        .mt-2 { margin-top: 8px; }
-        .mb-1 { margin-bottom: 4px; }
-        .mb-2 { margin-bottom: 8px; }
+        .grupo-card .grupo-check label:hover { color: #666; }
+
+        .logs-container {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px;
+            border: 1px solid #eee;
+            margin-top: 12px;
+        }
+        .logs-container .log-item {
+            background: #fff;
+            border: 1px solid #e8eaf6;
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .logs-container .log-item .log-info {
+            font-size: 0.7rem;
+            color: #555;
+        }
+        .logs-container .log-item .log-info .fecha {
+            color: #999;
+            font-size: 0.6rem;
+        }
+        .logs-container .log-item .log-info .usuario {
+            color: #1a237e;
+            font-weight: 600;
+        }
+        .logs-container .log-item .log-actions {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+        .logs-container .log-item .log-actions .btn-sm {
+            font-size: 0.6rem;
+            padding: 2px 10px;
+            border-radius: 12px;
+        }
+
+        .resumen-seleccion {
+            background: #e8f5e9;
+            border: 1px solid #c8e6c9;
+            border-radius: 6px;
+            padding: 6px 12px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .resumen-seleccion .contador {
+            color: #2e7d32;
+            font-weight: 600;
+            font-size: 0.75rem;
+        }
+        .resumen-seleccion .contador span {
+            font-size: 1rem;
+        }
+        .resumen-seleccion .texto {
+            color: #555;
+            font-size: 0.65rem;
+        }
+
+        .footer-custom {
+            border-top: 1px solid #eee;
+            padding-top: 10px;
+            margin-top: 16px;
+            text-align: center;
+        }
+        .footer-custom span {
+            color: #ccc;
+            font-size: 0.5rem;
+            letter-spacing: 2px;
+        }
+        .separator {
+            border-top: 1px solid #eee;
+            margin: 12px 0;
+        }
+        .mt-1 { margin-top: 4px !important; }
+        .mt-2 { margin-top: 8px !important; }
+        .mt-3 { margin-top: 12px !important; }
+        .mb-1 { margin-bottom: 4px !important; }
+        .mb-2 { margin-bottom: 8px !important; }
+        .mb-3 { margin-bottom: 12px !important; }
         .text-center { text-align: center; }
         .d-flex { display: flex; }
         .gap-1 { gap: 4px; }
@@ -1203,28 +1622,39 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         .justify-content-between { justify-content: space-between; }
     </style>
 </head>
-<body style="background: #0a0e1a; min-height: 100vh;">
+<body>
 
-    <nav class="navbar navbar-expand-lg navbar-dark" style="background: rgba(6, 10, 21, 0.95); border-bottom: 1px solid rgba(0, 240, 255, 0.06); backdrop-filter: blur(10px); padding: 4px 16px;">
+    <nav class="navbar navbar-custom">
         <div class="container-fluid">
-            <a class="navbar-brand" href="../../index.php" style="font-family: 'Orbitron', monospace; color: #00f0ff; font-weight: 900; font-size: 1.1rem;">
+            <a class="navbar-brand" href="../../index.php">
                 <i class="bi bi-boxes"></i> SIR
             </a>
-            <a class="btn btn-outline-light" href="buscar.php" style="border-radius: 30px; border-color: rgba(255,255,255,0.05); font-size: 0.6rem; padding: 3px 12px; color: rgba(200,214,229,0.3);">
-                <i class="bi bi-arrow-left"></i> Volver
-            </a>
+            <div>
+                <?php if ($mostrar_logs): ?>
+                    <a class="btn btn-outline-light" href="?ocultar_logs=1" style="margin-right:4px;">
+                        <i class="bi bi-x-circle"></i> Ocultar logs
+                    </a>
+                <?php else: ?>
+                    <a class="btn btn-outline-light" href="?ver_logs=1" style="margin-right:4px;">
+                        <i class="bi bi-clock-history"></i> Ver logs
+                    </a>
+                <?php endif; ?>
+                <a class="btn btn-outline-light" href="buscar.php">
+                    <i class="bi bi-arrow-left"></i> Volver
+                </a>
+            </div>
         </div>
     </nav>
 
-    <div class="container mt-2">
+    <div class="container mt-4">
         <div class="row justify-content-center">
             <div class="col-lg-12">
 
-                <div class="text-center mb-2">
-                    <h1 style="font-family: 'Orbitron', monospace; color: #00f0ff; font-weight: 700; font-size: 1.3rem; text-shadow: 0 0 30px rgba(0, 240, 255, 0.1);">
-                        <i class="bi bi-lightning-charge"></i> CARGA RÁPIDA
-                    </h1>
-                    <p style="color: rgba(200, 214, 229, 0.12); font-family: 'Rajdhani', sans-serif; letter-spacing: 2px; font-size: 0.55rem; text-transform: uppercase;">
+                <div class="text-center mb-3">
+                    <h2 style="color: #1a237e; font-weight: 700; font-size: 1.5rem;">
+                        <i class="bi bi-lightning-charge"></i> Carga Rápida
+                    </h2>
+                    <p style="color: #999; font-size: 0.75rem; letter-spacing: 1px; text-transform: uppercase;">
                         Sube tu Excel, edita, selecciona y importa
                     </p>
                 </div>
@@ -1235,36 +1665,97 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                     </div>
                 <?php endif; ?>
 
-                <div class="cyber-card">
-                    <div class="cyber-card-header">
+                <!-- ============================================ -->
+                <!-- LOGS DE IMPORTACIÓN                         -->
+                <!-- ============================================ -->
+                <?php if ($mostrar_logs): ?>
+                <div class="logs-container">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; margin-bottom:8px;">
+                        <span style="color: #1a237e; font-weight: 600; font-size: 0.75rem;">
+                            <i class="bi bi-clock-history"></i> HISTORIAL DE IMPORTACIONES
+                        </span>
+                        <span style="color:#aaa; font-size:0.55rem;">Últimas 50 importaciones</span>
+                    </div>
+                    
+                    <?php if (empty($logs_importacion)): ?>
+                        <div style="background:#fff; border-radius:6px; padding:12px; text-align:center; color:#aaa; font-size:0.7rem;">
+                            No hay importaciones registradas.
+                        </div>
+                    <?php else: ?>
+                        <?php foreach ($logs_importacion as $log): 
+                            $deshecho = $log['deshecho'] ?? 0;
+                            $fecha_deshecho = $log['fecha_deshecho'] ?? null;
+                            $equipos_importados = $log['equipos_importados'] ?? 0;
+                        ?>
+                        <div class="log-item" style="<?= $deshecho ? 'opacity:0.6;' : '' ?>">
+                            <div class="log-info">
+                                <span class="usuario"><i class="bi bi-person"></i> <?= htmlspecialchars($log['usuario']) ?></span>
+                                <span class="fecha"><i class="bi bi-calendar3"></i> <?= date('d/m/Y H:i', strtotime($log['fecha_importacion'])) ?></span>
+                                <span style="color:#666; font-size:0.6rem;">
+                                    <?= htmlspecialchars($log['nombre_archivo'] ?? 'manual') ?>
+                                </span>
+                                <span style="color:#2e7d32; font-size:0.65rem; font-weight:600;">
+                                    <?= $equipos_importados ?> equipos
+                                </span>
+                                <?php if ($log['errores'] > 0): ?>
+                                    <span style="color:#c62828; font-size:0.6rem;">⚠️ <?= $log['errores'] ?> errores</span>
+                                <?php endif; ?>
+                                <?php if ($deshecho): ?>
+                                    <span class="btn-deshecho eliminado">
+                                        <i class="bi bi-arrow-counterclockwise"></i> Deshecho
+                                        <?php if ($fecha_deshecho): ?>
+                                            <?= date('d/m/Y H:i', strtotime($fecha_deshecho)) ?>
+                                        <?php endif; ?>
+                                    </span>
+                                <?php else: ?>
+                                    <span class="btn-deshecho">✅ Activo</span>
+                                <?php endif; ?>
+                            </div>
+                            <div class="log-actions">
+                                <?php if (!$deshecho && $equipos_importados > 0): ?>
+                                    <a href="<?= $_SERVER['PHP_SELF'] ?>?deshacer=<?= $log['id'] ?>" 
+                                       class="btn btn-danger btn-sm" 
+                                       onclick="return confirm('¿Estás seguro de deshacer la importación #<?= $log['id'] ?>? Se eliminarán <?= $equipos_importados ?> equipos.')">
+                                        <i class="bi bi-arrow-counterclockwise"></i> Deshacer
+                                    </a>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
+
+                <div class="card card-custom">
+                    <div class="card-header">
                         <i class="bi bi-upload"></i> CARGA MASIVA
                         <?php if ($diagnostico): ?>
-                        <span style="color:rgba(200,214,229,0.15); font-size:0.5rem; margin-left:10px;">
+                        <span style="color:rgba(255,255,255,0.4); font-size:0.7rem; margin-left:10px;">
                             <?= count($diagnostico['validos']) ?> válidos · 
                             <?= count($diagnostico['invalidos']) ?> inválidos
                             <?php if ($total_duplicados > 0): ?>
-                            · <span style="color:#ffd93d;"><?= $total_duplicados ?> duplicados</span>
+                            · <span style="color:#ffc107;"><?= $total_duplicados ?> duplicados</span>
                             <?php endif; ?>
                         </span>
                         <?php endif; ?>
                     </div>
-                    <div class="cyber-card-body">
+                    <div class="card-body">
 
                         <?php if (!$diagnostico || empty($diagnostico['todos_los_datos'])): ?>
                         <form method="POST" enctype="multipart/form-data">
-                            <div style="background: rgba(0, 240, 255, 0.02); border-radius: 6px; padding: 10px; border: 1px solid rgba(0, 240, 255, 0.04);">
+                            <div style="background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #eee;">
                                 <div class="carga-tip">
                                     <i class="bi bi-info-circle"></i> Formatos soportados:
                                     <code>.xlsx</code> <code>.xls</code> <code>.csv</code>
                                     <br>Columnas esperadas:
                                     <code>CC, Nombre CC, Inventario, Activo, Nombre Equipo, Estatus, Fecha, Marca, Modelo, Serie</code>
                                 </div>
-                                <div class="row g-1">
+                                <div class="row g-2">
                                     <div class="col-md-8">
-                                        <input type="file" class="form-control form-control-sm" name="archivo_excel" accept=".xlsx,.xls,.csv" required style="background:rgba(0,240,255,0.02); border:1px solid rgba(0,240,255,0.1); color:#c8d6e5; font-size:0.75rem; padding:4px 8px;">
+                                        <input type="file" class="form-control form-control-custom" name="archivo_excel" accept=".xlsx,.xls,.csv" required style="padding:8px 12px; font-size:0.85rem;">
                                     </div>
                                     <div class="col-md-4 d-flex align-items-end">
-                                        <button type="submit" name="procesar_excel" class="carga-btn" style="padding:4px 16px; width:100%; font-size:0.6rem;">
+                                        <button type="submit" name="procesar_excel" class="carga-btn" style="padding:8px 16px; width:100%; font-size:0.75rem;">
                                             <i class="bi bi-search"></i> PROCESAR
                                         </button>
                                     </div>
@@ -1277,13 +1768,12 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                         
                         <div class="section-divider"></div>
 
-                        <!-- BOTÓN LIMPIAR -->
-                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; margin-bottom:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; margin-bottom:10px;">
                             <div style="display:flex; gap:4px; flex-wrap:wrap;">
                                 <?php if (!empty($diagnostico['invalidos'])): ?>
                                 <a href="<?= strtok($_SERVER['REQUEST_URI'], '?') ?>?exportar_errores=1" class="btn-exportar-errores">
                                     <i class="bi bi-download"></i> Exportar errores
-                                    <span style="background:rgba(255,215,0,0.1); padding:0 4px; border-radius:3px; font-size:0.45rem;">
+                                    <span style="background:rgba(255,215,0,0.1); padding:0 4px; border-radius:3px; font-size:0.6rem;">
                                         <?= count($diagnostico['invalidos']) ?>
                                     </span>
                                 </a>
@@ -1294,35 +1784,32 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                             </a>
                         </div>
 
-                        <!-- ============================================ -->
-                        <!-- PASO 2: SELECCIONAR EQUIPOS PARA IMPORTAR -->
-                        <!-- ============================================ -->
                         <?php if (!empty($diagnostico['grupos'])): ?>
-                        <div style="background: rgba(255, 215, 0, 0.02); border-radius: 6px; padding: 10px; border: 1px solid rgba(255, 215, 0, 0.06); margin-bottom: 10px;">
-                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; margin-bottom:6px;">
+                        <div style="background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #eee; margin-bottom: 12px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; margin-bottom:8px;">
                                 <div>
-                                    <span style="color: rgba(200, 214, 229, 0.3); font-size: 0.5rem; letter-spacing: 1px; text-transform: uppercase;">
-                                        <i class="bi bi-check2-square" style="color: #00e676;"></i> SELECCIONAR EQUIPOS PARA IMPORTAR
+                                    <span style="color: #666; font-size: 0.6rem; letter-spacing: 1px; text-transform: uppercase;">
+                                        <i class="bi bi-check2-square" style="color: #2e7d32;"></i> SELECCIONAR EQUIPOS PARA IMPORTAR
                                     </span>
-                                    <span style="color:rgba(200,214,229,0.12); font-size:0.45rem; margin-left:6px;">
-                                        (<?= $total_grupos ?> grupos · <?= $total_validos ?> equipos válidos)
+                                    <span style="color:#aaa; font-size:0.55rem; margin-left:6px;">
+                                        (<?= $total_grupos ?> grupos · <?= $total_validos ?> válidos)
                                         <?php if ($total_duplicados > 0): ?>
-                                        · <span style="color:#ffd93d;"><?= $total_duplicados ?> duplicados</span>
+                                        · <span style="color:#f57f17;"><?= $total_duplicados ?> duplicados</span>
                                         <?php endif; ?>
                                     </span>
                                 </div>
                                 <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                                    <span class="seleccion-todos" onclick="seleccionarTodosEquipos(true)" style="color:#00e676;">
-                                        ✅ Seleccionar todos los válidos
+                                    <span class="seleccion-todos" onclick="seleccionarTodosEquipos(true)" style="color:#2e7d32;">
+                                        ✅ Seleccionar todos
                                     </span>
-                                    <span class="seleccion-todos" onclick="seleccionarTodosEquipos(false)" style="color:rgba(200,214,229,0.3);">
-                                        ❌ Deseleccionar todos
+                                    <span class="seleccion-todos" onclick="seleccionarTodosEquipos(false)">
+                                        ❌ Deseleccionar
                                     </span>
                                 </div>
                             </div>
                             
                             <form method="POST" id="formSeleccionarEquipos">
-                                <div style="max-height:400px; overflow-y:auto; border-radius:4px; background:rgba(0,240,255,0.01); padding:4px;">
+                                <div style="max-height:400px; overflow-y:auto; border-radius:6px; background:#fff; padding:4px; border:1px solid #eee;">
                                     
                                     <?php foreach ($diagnostico['grupos'] as $key => $grupo): 
                                         $tipo_clase = strtolower($grupo['tipo']);
@@ -1331,25 +1818,24 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                         $total_duplicados_grupo = $grupo['duplicados'] ?? 0;
                                         $grupo_id = md5($key);
                                     ?>
-                                    <div style="margin-bottom:6px; border:1px solid rgba(0,240,255,0.04); border-radius:4px; padding:4px 8px; background:rgba(0,240,255,0.01);">
+                                    <div style="margin-bottom:6px; border:1px solid #f0f0f0; border-radius:6px; padding:4px 8px; background:#fafafa;">
                                         
-                                        <!-- CABECERA DEL GRUPO -->
                                         <div class="grupo-header d-flex justify-content-between align-items-center" onclick="toggleGrupo('<?= $grupo_id ?>')">
                                             <div class="d-flex align-items-center gap-1">
-                                                <span id="icon_<?= $grupo_id ?>" style="color:rgba(200,214,229,0.2); font-size:0.5rem;">▶</span>
-                                                <span style="color: #00f0ff; font-weight: 600; font-size: 0.65rem;">
+                                                <span id="icon_<?= $grupo_id ?>" style="color:#aaa; font-size:0.5rem;">▶</span>
+                                                <span style="color: #1a237e; font-weight: 600; font-size: 0.7rem;">
                                                     <i class="bi bi-geo-alt"></i> <?= htmlspecialchars($grupo['ubicacion']) ?>
                                                 </span>
                                                 <span class="badge-tipo <?= $tipo_clase ?>"><?= $grupo['tipo'] ?></span>
                                                 <?php if ($tiene_validos): ?>
-                                                    <span style="color:#00e676; font-size:0.45rem;">(<?= $total_validos_grupo ?> válidos)</span>
+                                                    <span style="color:#2e7d32; font-size:0.5rem;">(<?= $total_validos_grupo ?> válidos)</span>
                                                 <?php endif; ?>
                                                 <?php if ($total_duplicados_grupo > 0): ?>
-                                                    <span style="color:#ffd93d; font-size:0.45rem;">⚠️ <?= $total_duplicados_grupo ?> duplicados</span>
+                                                    <span style="color:#f57f17; font-size:0.5rem;">⚠️ <?= $total_duplicados_grupo ?> duplicados</span>
                                                 <?php endif; ?>
                                             </div>
                                             <div class="d-flex align-items-center gap-1">
-                                                <span style="color:rgba(200,214,229,0.12); font-size:0.4rem;"><?= $grupo['total'] ?> equipos</span>
+                                                <span style="color:#aaa; font-size:0.45rem;"><?= $grupo['total'] ?> equipos</span>
                                                 <?php if ($tiene_validos): ?>
                                                     <input type="checkbox" class="grupo-selector" data-grupo="<?= $grupo_id ?>" 
                                                            onchange="seleccionarGrupo('<?= $grupo_id ?>', this.checked)" checked>
@@ -1357,7 +1843,6 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                             </div>
                                         </div>
                                         
-                                        <!-- LISTA DE EQUIPOS DEL GRUPO (colapsable) -->
                                         <div id="grupo_<?= $grupo_id ?>" class="grupo-contenido">
                                             <?php foreach ($grupo['equipos'] as $equipo):
                                                 $es_valido = $equipo['es_valido'] && !$equipo['es_duplicado'];
@@ -1369,7 +1854,8 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                                 <?php if ($es_valido): ?>
                                                     <input type="checkbox" name="equipos_seleccionar[]" 
                                                            value="<?= htmlspecialchars($equipo['inventario']) ?>" 
-                                                           class="equipo-checkbox grupo-<?= $grupo_id ?>" checked>
+                                                           class="equipo-checkbox grupo-<?= $grupo_id ?>" checked
+                                                           onchange="actualizarPrevisualizacion()">
                                                     <span class="estado-icon valido">✅</span>
                                                 <?php else: ?>
                                                     <span style="width:14px;"></span>
@@ -1407,21 +1893,15 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                     <?php endforeach; ?>
                                 </div>
                                 
-                                <div class="d-flex gap-1 flex-wrap mt-1">
+                                <div class="d-flex gap-1 flex-wrap mt-2">
                                     <button type="submit" name="seleccionar_equipos" class="carga-btn-success" id="btnSeleccionarEquipos">
                                         <i class="bi bi-check-lg"></i> IMPORTAR EQUIPOS SELECCIONADOS
                                     </button>
-                                    <span style="color:rgba(200,214,229,0.08); font-size:0.5rem; align-self:center;">
-                                        Solo los equipos marcados con ✅ se importarán
-                                    </span>
                                 </div>
                             </form>
                         </div>
                         <?php endif; ?>
 
-                        <!-- ============================================ -->
-                        <!-- PASO 3: DATOS CONSTANTES -->
-                        <!-- ============================================ -->
                         <?php 
                         $hay_seleccionados = false;
                         if ($diagnostico && isset($diagnostico['validos']) && count($diagnostico['validos']) > 0) {
@@ -1431,10 +1911,10 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                         
                         <?php if ($hay_seleccionados || !empty($diagnostico['validos'])): ?>
                         <form method="POST" id="formImportar">
-                            <div style="background: rgba(255, 215, 0, 0.02); border-radius: 6px; padding: 10px; border: 1px solid rgba(255, 215, 0, 0.06); margin-bottom: 10px;">
-                                <div style="color: rgba(200, 214, 229, 0.3); font-size: 0.5rem; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px;">
-                                    <i class="bi bi-gear" style="color: #ffd93d;"></i> DATOS CONSTANTES
-                                    <span style="color:rgba(200,214,229,0.1); font-size:0.45rem; font-weight:normal; text-transform:none;">
+                            <div style="background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #eee; margin-bottom: 12px;">
+                                <div style="color: #999; font-size: 0.6rem; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px;">
+                                    <i class="bi bi-gear" style="color: #f57f17;"></i> DATOS CONSTANTES
+                                    <span style="color:#ccc; font-size:0.5rem; font-weight:normal; text-transform:none;">
                                         (se aplican a todos los equipos)
                                     </span>
                                 </div>
@@ -1460,9 +1940,9 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                 
                                 <?php if ($hay_pc): ?>
                                 <div class="campos-especificos visible">
-                                    <div style="color: rgba(200, 214, 229, 0.2); font-size: 0.5rem; letter-spacing: 0.5px; margin-bottom: 4px;">
+                                    <div style="color: #999; font-size: 0.55rem; letter-spacing: 0.5px; margin-bottom: 4px;">
                                         <span class="badge-tipo-mini pc">💻 PC</span>
-                                        <span style="color:rgba(200,214,229,0.1); font-size:0.45rem;">(solo para equipos PC)</span>
+                                        <span style="color:#ccc; font-size:0.5rem;">(solo para equipos PC)</span>
                                     </div>
                                     <div class="carga-grid">
                                         <div>
@@ -1487,9 +1967,9 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                 
                                 <?php if ($hay_ups): ?>
                                 <div class="campos-especificos visible">
-                                    <div style="color: rgba(200, 214, 229, 0.2); font-size: 0.5rem; letter-spacing: 0.5px; margin-bottom: 4px;">
+                                    <div style="color: #999; font-size: 0.55rem; letter-spacing: 0.5px; margin-bottom: 4px;">
                                         <span class="badge-tipo-mini ups">⚡ UPS</span>
-                                        <span style="color:rgba(200,214,229,0.1); font-size:0.45rem;">(solo para equipos UPS)</span>
+                                        <span style="color:#ccc; font-size:0.5rem;">(solo para equipos UPS)</span>
                                     </div>
                                     <div class="carga-grid">
                                         <div>
@@ -1505,30 +1985,29 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                 <?php endif; ?>
                             </div>
 
-                            <!-- ============================================ -->
-                            <!-- PASO 4: PREVISUALIZACIÓN CON EDICIÓN EN LÍNEA -->
-                            <!-- ============================================ -->
                             <div class="diagnostico-container">
-                                <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-1">
-                                    <div style="color: #00e676; font-family:'Orbitron',monospace; font-size:0.6rem; letter-spacing:1px;">
-                                        <i class="bi bi-pencil" style="color:#ffd93d;"></i> EDICIÓN EN LÍNEA
-                                        <span style="color:rgba(200,214,229,0.1); font-size:0.45rem; font-weight:normal;">
+                                <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-1">
+                                    <div style="color: #2e7d32; font-weight: 700; font-size: 0.75rem; letter-spacing:0.5px;">
+                                        <i class="bi bi-pencil" style="color:#f57f17;"></i> EDICIÓN EN LÍNEA
+                                        <span style="color:#aaa; font-size:0.6rem; font-weight:normal;">
                                             (click en los campos para editar)
                                         </span>
                                     </div>
-                                    <span style="color:rgba(200,214,229,0.15); font-size:0.5rem;">
+                                    <span style="color:#aaa; font-size:0.6rem;" id="contadorPrevisualizacion">
                                         <?= count($diagnostico['validos']) ?> equipos válidos
                                     </span>
                                 </div>
 
-                                <!-- Tabla de VÁLIDOS con edición en línea -->
+                                <!-- ============================================ -->
+                                <!-- PREVISUALIZACIÓN DINÁMICA                   -->
+                                <!-- ============================================ -->
                                 <?php if (!empty($diagnostico['validos'])): ?>
-                                <div style="background:rgba(0,230,118,0.02); border-radius:4px; padding:2px 6px; border:1px solid rgba(0,230,118,0.08);">
-                                    <div style="color:rgba(200,214,229,0.15); font-size:0.45rem; letter-spacing:0.5px; margin-bottom:2px;">
+                                <div style="background:#fff; border-radius:6px; padding:4px 8px; border:1px solid #e8f5e9;">
+                                    <div style="color:#aaa; font-size:0.5rem; letter-spacing:0.5px; margin-bottom:4px;">
                                         <i class="bi bi-table"></i> PREVISUALIZACIÓN
-                                        <span class="table-count">(<?= count($diagnostico['validos']) ?> equipos)</span>
+                                        <span class="table-count" id="contadorTabla">(<?= count($diagnostico['validos']) ?> equipos seleccionados)</span>
                                     </div>
-                                    <div class="diagnostico-scroll">
+                                    <div class="diagnostico-scroll" id="tablaScroll">
                                         <table class="diagnostico-table" id="tablaEditable">
                                             <thead>
                                                 <tr>
@@ -1544,14 +2023,14 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                                     <th style="width:50px;">Estado</th>
                                                 </tr>
                                             </thead>
-                                            <tbody>
+                                            <tbody id="tablaBody">
                                                 <?php foreach ($diagnostico['validos'] as $index => $equipo): 
                                                     $tipo_clase = strtolower($equipo['tipo'] ?? 'otros');
                                                     $row_id = 'row_' . $index;
                                                 ?>
-                                                <tr class="row-valid" id="<?= $row_id ?>">
+                                                <tr class="row-valid" id="<?= $row_id ?>" data-inventario="<?= htmlspecialchars($equipo['inventario']) ?>">
                                                     <td><?= $equipo['fila'] ?></td>
-                                                    <td><strong style="color:#00f0ff;"><?= htmlspecialchars($equipo['inventario'] ?? '') ?></strong></td>
+                                                    <td><strong style="color:#1a237e;"><?= htmlspecialchars($equipo['inventario'] ?? '') ?></strong></td>
                                                     <td><span class="badge-activo"><?= htmlspecialchars($equipo['activo'] ?? '') ?></span></td>
                                                     <td><?= htmlspecialchars($equipo['cc'] ?? '') ?></td>
                                                     <td><?= htmlspecialchars($equipo['ubicacion'] ?? '') ?></td>
@@ -1580,22 +2059,30 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                             </tbody>
                                         </table>
                                     </div>
-                                    <div style="color:rgba(200,214,229,0.06); font-size:0.4rem; padding:2px 4px; text-align:right;">
+                                    <div style="color:#ccc; font-size:0.45rem; padding:4px 4px; text-align:right;">
                                         <i class="bi bi-info-circle"></i> Los cambios se guardan automáticamente al importar
                                     </div>
                                 </div>
                                 <?php endif; ?>
 
-                                <!-- ============================================ -->
-                                <!-- ERRORES (INVÁLIDOS + DUPLICADOS) -->
-                                <!-- ============================================ -->
+                                <!-- Resumen de selección -->
+                                <div class="resumen-seleccion mt-2" id="resumenSeleccion">
+                                    <span class="texto">
+                                        <i class="bi bi-check-circle-fill" style="color:#2e7d32;"></i>
+                                        Equipos seleccionados para importar:
+                                    </span>
+                                    <span class="contador">
+                                        <span id="totalSeleccionados"><?= count($diagnostico['validos']) ?></span> equipos
+                                    </span>
+                                </div>
+
                                 <?php if (!empty($diagnostico['invalidos'])): ?>
-                                <div style="margin-top:8px;">
-                                    <div style="color:rgba(200,214,229,0.15); font-size:0.45rem; letter-spacing:0.5px; margin-bottom:4px;">
-                                        <i class="bi bi-exclamation-triangle" style="color:#ff2d55;"></i> EQUIPOS OMITIDOS (NO SE IMPORTARÁN)
-                                        <span style="color:rgba(200,214,229,0.1); font-size:0.4rem;">(<?= count($diagnostico['invalidos']) ?> equipos)</span>
+                                <div style="margin-top:10px;">
+                                    <div style="color:#aaa; font-size:0.5rem; letter-spacing:0.5px; margin-bottom:4px;">
+                                        <i class="bi bi-exclamation-triangle" style="color:#c62828;"></i> EQUIPOS OMITIDOS (NO SE IMPORTARÁN)
+                                        <span style="color:#ccc; font-size:0.45rem;">(<?= count($diagnostico['invalidos']) ?> equipos)</span>
                                         <?php if (!empty($diagnostico['invalidos'])): ?>
-                                        <a href="<?= strtok($_SERVER['REQUEST_URI'], '?') ?>?exportar_errores=1" class="btn-exportar-errores" style="font-size:0.45rem; padding:1px 8px; margin-left:4px;">
+                                        <a href="<?= strtok($_SERVER['REQUEST_URI'], '?') ?>?exportar_errores=1" class="btn-exportar-errores" style="font-size:0.5rem; padding:1px 10px; margin-left:6px;">
                                             <i class="bi bi-download"></i> Exportar
                                         </a>
                                         <?php endif; ?>
@@ -1606,12 +2093,12 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                             $badge_clase = $es_duplicado ? 'duplicado' : 'invalid';
                                         ?>
                                         <div class="error-item">
-                                            <strong style="color:<?= $es_duplicado ? '#ffd93d' : '#ff2d55' ?>;">
+                                            <strong style="color:<?= $es_duplicado ? '#f57f17' : '#c62828' ?>;">
                                                 Fila <?= $equipo['fila'] ?>
                                             </strong> 
                                             (Inv: <?= htmlspecialchars($equipo['inventario'] ?? 'N/A') ?>):
                                             <?php foreach ($equipo['errores'] as $error): ?>
-                                                <span class="badge-<?= $badge_clase ?>" style="margin-left:2px; font-size:0.45rem;"><?= $error ?></span>
+                                                <span class="badge-<?= $badge_clase ?>" style="margin-left:2px; font-size:0.5rem;"><?= $error ?></span>
                                             <?php endforeach; ?>
                                         </div>
                                         <?php endforeach; ?>
@@ -1620,14 +2107,13 @@ $hay_ups = in_array('UPS', $tipos_presentes);
                                 <?php endif; ?>
                             </div>
 
-                            <!-- Botón importar -->
-                            <div style="background:rgba(0,230,118,0.02); border-radius:4px; padding:8px; border:1px solid rgba(0,230,118,0.06); margin-top:8px;">
+                            <div style="background:#f8f9fa; border-radius:6px; padding:10px; border:1px solid #e8f5e9; margin-top:10px;">
                                 <input type="hidden" name="confirmar_importacion" value="1">
-                                <button type="submit" class="carga-btn-success" <?= empty($diagnostico['validos']) ? 'disabled' : '' ?> style="width:100%;">
+                                <button type="submit" class="carga-btn-success" <?= empty($diagnostico['validos']) ? 'disabled' : '' ?> style="width:100%;" id="btnImportar">
                                     <i class="bi bi-check-lg"></i> 
-                                    IMPORTAR <?= count($diagnostico['validos']) ?> EQUIPOS VÁLIDOS
+                                    IMPORTAR <span id="btnContadorImportar"><?= count($diagnostico['validos']) ?></span> EQUIPOS VÁLIDOS
                                 </button>
-                                <div style="text-align:center; margin-top:2px; color:rgba(200,214,229,0.08); font-size:0.45rem;">
+                                <div style="text-align:center; margin-top:4px; color:#ccc; font-size:0.5rem;">
                                     <?= count($diagnostico['invalidos']) ?> equipos con errores serán omitidos
                                 </div>
                             </div>
@@ -1636,13 +2122,16 @@ $hay_ups = in_array('UPS', $tipos_presentes);
 
                         <?php endif; ?>
 
+                        <div class="separator"></div>
+                        <a href="buscar.php" class="btn-outline-custom">
+                            <i class="bi bi-arrow-left"></i> Volver al buscador
+                        </a>
+
                     </div>
                 </div>
 
-                <div class="text-center mt-2" style="border-top: 1px solid rgba(0, 240, 255, 0.03); padding-top: 6px;">
-                    <span style="color: rgba(200, 214, 229, 0.05); font-family: 'Rajdhani', sans-serif; font-size: 0.45rem; letter-spacing: 3px;">
-                        <i class="bi bi-cpu"></i> SIR v3.0
-                    </span>
+                <div class="footer-custom">
+                    <span><i class="bi bi-cpu"></i> SIR v3.0</span>
                 </div>
 
             </div>
@@ -1654,7 +2143,6 @@ $hay_ups = in_array('UPS', $tipos_presentes);
     // FUNCIONES PARA SELECCIÓN POR EQUIPO
     // ============================================
 
-    // Alternar visibilidad de un grupo
     function toggleGrupo(grupoId) {
         var container = document.getElementById('grupo_' + grupoId);
         var icon = document.getElementById('icon_' + grupoId);
@@ -1669,22 +2157,20 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         }
     }
 
-    // Seleccionar/deseleccionar todos los equipos de un grupo
     function seleccionarGrupo(grupoId, seleccionar) {
         var checkboxes = document.querySelectorAll('.grupo-' + grupoId);
         checkboxes.forEach(function(cb) {
             cb.checked = seleccionar;
         });
         actualizarContador();
+        actualizarPrevisualizacion();
     }
 
-    // Seleccionar/deseleccionar TODOS los equipos válidos
     function seleccionarTodosEquipos(seleccionar) {
         var checkboxes = document.querySelectorAll('.equipo-checkbox');
         checkboxes.forEach(function(cb) {
             cb.checked = seleccionar;
         });
-        // Actualizar checkboxes de grupo
         document.querySelectorAll('.grupo-selector').forEach(function(cb) {
             var grupoId = cb.getAttribute('data-grupo');
             var checkboxesGrupo = document.querySelectorAll('.grupo-' + grupoId);
@@ -1695,12 +2181,51 @@ $hay_ups = in_array('UPS', $tipos_presentes);
             cb.checked = todosSeleccionados && checkboxesGrupo.length > 0;
         });
         actualizarContador();
+        actualizarPrevisualizacion();
     }
 
-    // Contador de equipos seleccionados
+    // ============================================
+    // ACTUALIZAR PREVISUALIZACIÓN
+    // ============================================
+    function actualizarPrevisualizacion() {
+        var seleccionados = [];
+        document.querySelectorAll('.equipo-checkbox:checked').forEach(function(cb) {
+            seleccionados.push(cb.value);
+        });
+
+        var filas = document.querySelectorAll('#tablaBody tr');
+        var contadorVisibles = 0;
+        filas.forEach(function(tr) {
+            var inventario = tr.getAttribute('data-inventario');
+            if (seleccionados.includes(inventario)) {
+                tr.style.display = '';
+                contadorVisibles++;
+            } else {
+                tr.style.display = 'none';
+            }
+        });
+
+        document.getElementById('totalSeleccionados').textContent = contadorVisibles;
+        document.getElementById('contadorTabla').textContent = '(' + contadorVisibles + ' equipos seleccionados)';
+        document.getElementById('contadorPrevisualizacion').textContent = contadorVisibles + ' equipos válidos';
+        document.getElementById('btnContadorImportar').textContent = contadorVisibles;
+
+        var btnImportar = document.getElementById('btnImportar');
+        if (contadorVisibles === 0) {
+            btnImportar.disabled = true;
+        } else {
+            btnImportar.disabled = false;
+        }
+
+        var btnSeleccionar = document.getElementById('btnSeleccionarEquipos');
+        if (btnSeleccionar) {
+            btnSeleccionar.innerHTML = '<i class="bi bi-check-lg"></i> IMPORTAR ' + contadorVisibles + ' EQUIPOS SELECCIONADOS';
+            btnSeleccionar.disabled = (contadorVisibles === 0);
+        }
+    }
+
     function actualizarContador() {
         var seleccionados = document.querySelectorAll('.equipo-checkbox:checked').length;
-        var total = document.querySelectorAll('.equipo-checkbox').length;
         var btn = document.getElementById('btnSeleccionarEquipos');
         if (btn) {
             btn.innerHTML = '<i class="bi bi-check-lg"></i> IMPORTAR ' + seleccionados + ' EQUIPOS SELECCIONADOS';
@@ -1708,11 +2233,11 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         }
     }
 
-    // Actualizar contador cuando cambia un checkbox
     document.addEventListener('change', function(e) {
         if (e.target.classList && e.target.classList.contains('equipo-checkbox')) {
             actualizarContador();
-            // Actualizar checkbox del grupo
+            actualizarPrevisualizacion();
+            
             var grupoId = e.target.className.split(' ').find(function(c) { return c.startsWith('grupo-'); });
             if (grupoId) {
                 var id = grupoId.replace('grupo-', '');
@@ -1729,9 +2254,6 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         }
     });
 
-    // ============================================
-    // EDICIÓN EN LÍNEA
-    // ============================================
     var cambiosPendientes = {};
 
     function actualizarEquipo(rowId, campo, valor) {
@@ -1740,7 +2262,6 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         }
         cambiosPendientes[rowId][campo] = valor;
         
-        // Marcar el input como cambiado
         var input = document.querySelector('#tablaEditable input[data-row="' + rowId + '"][data-field="' + campo + '"]');
         if (input) {
             input.classList.add('cambiado');
@@ -1750,9 +2271,16 @@ $hay_ups = in_array('UPS', $tipos_presentes);
         }
     }
 
-    // Inicializar contador al cargar
     document.addEventListener('DOMContentLoaded', function() {
         actualizarContador();
+        actualizarPrevisualizacion();
+        
+        document.querySelectorAll('.grupo-contenido').forEach(function(el) {
+            el.classList.add('abierto');
+        });
+        document.querySelectorAll('.grupo-header .icono').forEach(function(el) {
+            el.textContent = '▼';
+        });
     });
     </script>
 
